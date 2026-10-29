@@ -9,7 +9,7 @@ description: >-
   monitoring permission errors. Don't use to configure local application logging
   frameworks or external APMs outside GKE.
 metadata:
-  version: "1.1.9"
+  version: "1.1.10"
   category: CloudObservabilityAndMonitoring
 ---
 
@@ -295,15 +295,42 @@ gcloud logging read \
     `roles/cloudkms.cryptoKeyEncrypterDecrypter` IAM role, and following
     https://docs.cloud.google.com/kubernetes-engine/docs/how-to/encrypting-secrets#reencrypt-secrets
     to re-encrypt existing Secrets after key rotation or recovery.
--   **End-to-end pod startup lifecycle timeline**: To determine whether a
-    slow-starting pod was delayed during controller creation, scheduling,
-    `kubelet` pickup, or container startup, reconstruct its timeline in Cloud
-    Logging by correlating Kubernetes Events (`resource.type="k8s_pod"` or
-    `k8s_event`) with Cloud Audit Logs (`cloudaudit.googleapis.com/activity`),
-    optional control-plane component logs (`kube-scheduler`,
-    `kube-controller-manager`, and `kube-apiserver` under
-    `resource.type="k8s_control_plane_component"`), and node `kubelet` logs
-    (`resource.type="k8s_node"`).
+-   **In-cluster GCP IAM OAuth tokens saturating the GKE IAM webhook authorizer
+    (`Failed to make webhook authorizer request`)**: When high-QPS in-cluster
+    clients (`Helm`, operators) authenticate with GCP IAM OAuth Bearer tokens
+    without matching Kubernetes RBAC bindings, `kube-apiserver` must invoke the
+    external GKE IAM webhook authorizer on every request, which can throttle or
+    time out under load (`Failed to make webhook authorizer request: the server
+    is currently unable to handle the request`). Inspect Cloud Audit Logs
+    (`protoPayload.authenticationInfo` and `protoPayload.authorizationInfo`) and
+    migrate in-cluster workloads to native Kubernetes `ServiceAccount` tokens
+    bound via Kubernetes RBAC (`RoleBinding` / `ClusterRoleBinding`) so
+    authorization is evaluated locally in memory.
+-   **End-to-end pod startup lifecycle, mass eviction, and Autopilot
+    preemption**: To determine whether a slow-starting pod was delayed during
+    controller creation, scheduling, `kubelet` pickup, or container startup,
+    reconstruct its timeline in Cloud Logging by correlating Kubernetes Events
+    (`resource.type="k8s_pod"` or `k8s_event`) with Cloud Audit Logs
+    (`cloudaudit.googleapis.com/activity`), optional control-plane component
+    logs (`kube-scheduler`, `kube-controller-manager`, and `kube-apiserver`
+    under `resource.type="k8s_control_plane_component"`), and node `kubelet`
+    logs (`resource.type="k8s_node"`).
+    -   **`tolerationSeconds: 0` mass pod eviction**: If pods are simultaneously
+        evicted during a brief control-plane hiccup when nodes briefly enter
+        `NodeStatusUnknown`, inspect workload Pod or Deployment specs (`kubectl
+        get deploy -o yaml`) for custom `tolerations` on
+        `node.kubernetes.io/unreachable` (`NoExecute`) and
+        `node.kubernetes.io/not-ready` (`NoExecute`) that set
+        `tolerationSeconds: 0` (which overrides Kubernetes's default 300-second
+        eviction grace period), and remove the `tolerationSeconds: 0` override.
+    -   **Autopilot single-node bin-packing and system-addon preemption**: If
+        all replicas of a Deployment pack onto a single node at its `maxPods`
+        limit (`32/32` on Autopilot), surging `system-cluster-critical` addons
+        (priority `2000000000`) during a control-plane upgrade trigger scheduler
+        preemption, which bypasses `PodDisruptionBudget` when no other capacity
+        is immediately available; configure `topologySpreadConstraints` or
+        `podAntiAffinity` across nodes/zones so replicas never co-locate on a
+        single node, and assign an appropriate `PriorityClass`.
 
 ## Diagnostic Settings
 
@@ -443,6 +470,22 @@ A comprehensive assessment of node health relies on analyzing these two metrics 
 
 1.  **`kubernetes.io/node/status_condition`** (filtered by `status_condition="Ready"`): Use this to track healthy nodes. Note that it will only report values for nodes that have successfully bootstrapped.
 2.  **`compute.googleapis.com/instance_group/size`** (filtered by `instance_group_name="gke-<cluster_name>-.*"`): Use this to track the total number of nodes in a specific cluster. Note that it does not differentiate between healthy and unhealthy nodes.
+3.  **Node registration failures (`AUTO_REPAIR_NODES`)**: When new node pools
+    fail registration before reporting `kubernetes.io/node/status_condition`,
+    query the consumer project's Cloud Audit Logs
+    (`cloudaudit.googleapis.com/activity`) for GCE instance creation denials
+    (`403` / `constraints/gcp.resourceLocations`), verify that Private Google
+    Access (`privateIpGoogleAccess`) is enabled on the cluster subnet, and check
+    VPC routes and firewall rules to ensure traffic to `*.googleapis.com`,
+    `*.gcr.io`, and `*.pkg.dev` is not blackholed into a custom VPN or firewall.
+4.  **Node labels overwritten on upgrade (`kubectl label node` vs. Node Pool
+    API)**: `gcp-controller-manager` reconciles node labels declared in the GKE
+    Node Pool API specification during control-plane upgrades and node repairs
+    (observable via `system:gcp-controller-manager` node patches in Cloud Audit
+    Logs), reverting manual `kubectl label node <node> <key>=<val> --overwrite`
+    edits on GKE-managed label keys. Always update node pool labels persistently
+    via `gcloud container node-pools update <pool> --node-labels=...` (or
+    Terraform `node_config.labels`).
 
 ### Control Plane Health (Production Rules)
 
