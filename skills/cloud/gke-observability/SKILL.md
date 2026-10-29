@@ -9,7 +9,7 @@ description: >-
   monitoring permission errors. Don't use to configure local application logging
   frameworks or external APMs outside GKE.
 metadata:
-  version: "1.1.10"
+  version: "1.1.11"
   category: CloudObservabilityAndMonitoring
 ---
 
@@ -65,20 +65,29 @@ https://docs.cloud.google.com/kubernetes-engine/docs/how-to/control-plane-metric
 
 -   **API storage utilization by resource
     (`apiserver_resource_size_estimate_bytes`)**: Use
-    `apiserver_resource_size_estimate_bytes` (grouped by `group` and `resource`)
-    to identify which Kubernetes resource types consume the most API server
-    storage bytes in etcd, complementing object counts
-    (`apiserver_storage_objects`), total database size
-    (`apiserver_storage_size_bytes`), and real-time cluster storage quota metrics
-    (`kubernetes.io/cluster/storage/used_bytes` and
-    `kubernetes.io/cluster/storage/limit_bytes`).
-    -   **Quota exhaustion (`etcdserver: mvcc: database space exceeded`)**: When
-        leaked finished `batch/v1` Jobs and Pods exhaust control-plane storage
-        and cause object creations, updates, or controller Lease renewals to fail
-        (note that while some earlier GKE versions blocked all edits, including
-        deletes, upon hitting storage quota, this is no longer the case and
-        `kubectl delete` remains permitted), delete finished objects in small
-        paced batches and configure `.spec.ttlSecondsAfterFinished` on Jobs plus
+    `apiserver_resource_size_estimate_bytes` (or
+    `kubernetes.io/master/apiserver/resource_size_estimate_bytes`, grouped by
+    `group` and `resource`) alongside `apiserver_storage_objects` (grouped by
+    `group` and `resource`) to identify which Kubernetes resource types or CRDs
+    consume the most API server storage bytes in etcd, complementing total
+    database size (`apiserver_storage_size_bytes`) and real-time cluster storage
+    quota metrics (`kubernetes.io/cluster/storage/used_bytes` and
+    `kubernetes.io/cluster/storage/limit_bytes` in Cloud Monitoring).
+    -   **Quota exhaustion (`etcdserver: mvcc: database space exceeded`) and CRD
+        bloat**: Configure a Cloud Monitoring alert on
+        `kubernetes.io/cluster/storage/used_bytes /
+        kubernetes.io/cluster/storage/limit_bytes` (or
+        `apiserver_storage_size_bytes`) before control-plane storage approaches
+        capacity. When storage quota is exhausted and object creations, updates,
+        or controller Lease renewals fail (note that while some earlier GKE
+        versions blocked all edits, including deletes, upon hitting storage
+        quota, this is no longer the case and `kubectl delete` remains
+        permitted), prune bloated resources (such as leaked finished `batch/v1`
+        Jobs and runaway CronJob pods with `concurrencyPolicy: Allow`,
+        accumulated Kyverno `admissionreports` / policy reports, or custom
+        resources stuck terminating on a missing finalizer controller) in small
+        paced batches, and configure `.spec.ttlSecondsAfterFinished` on Jobs
+        plus
         `successfulJobsHistoryLimit` and `failedJobsHistoryLimit` on CronJobs to
         prevent recurrence.
     -   **Excessive `VolumeSnapshot` objects hanging `LIST`**: When new
@@ -92,36 +101,49 @@ https://docs.cloud.google.com/kubernetes-engine/docs/how-to/control-plane-metric
         retention policy keeping the total count well below 50,000.
 -   **Admission webhook latency, timeouts, and control-plane recommendations
     (`apiserver_admission_webhook_admission_duration_seconds`)**: When API calls
-    time out or fail and mutating or validating admission webhooks are
-    suspected, query the opt-in GMP metric
+    or pod creations time out (`context deadline exceeded`) or fail and mutating
+    or validating admission webhooks are suspected, query the opt-in GMP metric
     `apiserver_admission_webhook_admission_duration_seconds` (grouped by `name`,
     `type`, `operation`, and `rejected`) alongside `kube-apiserver` slow-request
-    `Trace[` logs, GKE Webhook Insights, and
-    `kubernetes.io/cluster/kcp_healthchecks` (to verify whether the GKE control
-    plane itself is healthy before requesting a control-plane upsize).
-    -   **Webhook rules, system namespace exclusions, and upgrade deadlocks**:
-        Inspect `ValidatingWebhookConfiguration` and
+    `Trace[` logs, GKE Control Plane / Webhook Insights (`Verify webhook with
+    unavailable endpoints`), and `kubernetes.io/cluster/kcp_healthchecks` (to
+    verify whether the GKE control plane itself is healthy before requesting a
+    control-plane upsize). Tune the webhook timeout (`timeoutSeconds`), fix or
+    scale the backing webhook service pods, or adjust `failurePolicy` so slow
+    image inspection or unavailable webhook backends do not block pod creation.
+    -   **Webhook rules, system namespace exclusions, CNI initialization, and
+        upgrade deadlocks**: Inspect `ValidatingWebhookConfiguration` and
         `MutatingWebhookConfiguration` rules, `timeoutSeconds`, and
         `failurePolicy`. Always exclude `kube-system` and `kube-node-lease` via
-        `namespaceSelector` (or Gatekeeper's `admission.gatekeeper.sh/ignore`
+        `namespaceSelector` on third-party webhooks (such as Kyverno, Datadog,
+        Vault, OpenTelemetry, or Gatekeeper's `admission.gatekeeper.sh/ignore`
         label) and remove `coordination.k8s.io` `leases`
         (`coordination.k8s.io/leases`) from webhook rules so crashed or slow
-        webhooks never block controller Lease renewals. If control-plane
-        upgrades fail and roll back or Cluster Autoscaler stops
-        initializing after an upgrade, check Cloud Audit Logs or webhook
-        metrics/logs during the upgrade window for denied or timed-out requests
-        from `system:apiserver` (on
+        webhooks never block controller Lease renewals or `kube-system` CNI pods
+        (`netd`, `anetd`, leaving new nodes stuck `NotReady` with `CNI plugin
+        not initialized`). If control-plane upgrades fail and roll back or
+        Cluster Autoscaler stops initializing after an upgrade, check Cloud
+        Audit Logs or webhook metrics/logs during the upgrade window for denied
+        or timed-out requests from `system:apiserver` (on
         `rbac.authorization.k8s.io/clusterrolebindings`) or
         `system:addon-manager` (on system `customresourcedefinitions` such as
         `capacitybuffers.autoscaling.x-k8s.io`), and exempt
         `rbac.authorization.k8s.io` bootstrap bindings and GKE system CRDs
         (`*.gke.io`, `autoscaling.x-k8s.io`) from webhook rules or set
-        `failurePolicy: Ignore`.
-    -   **Broken `APIService`, CRD conversion webhooks, and stale
-        `EndpointSlice`**: Run `kubectl get apiservices` to spot unavailable
-        `APIService` backends, inspect CRD conversion webhook targets
-        (`spec.conversion.webhook`), and verify that webhook `EndpointSlice`
-        addresses match running pod IPs.
+        `failurePolicy: Ignore` (or remove the broken webhook).
+    -   **Broken `APIService`, CRD conversion webhooks, unavailable endpoints,
+        and OOMKilled webhook pods**: Run `kubectl get apiservices` to spot
+        unavailable `APIService` backends, inspect CRD conversion webhook
+        targets (`spec.conversion.webhook`), and verify that webhook
+        `EndpointSlice` addresses match running pod IPs. When a webhook has
+        unavailable endpoints, inspect `MutatingWebhookConfiguration` and
+        `ValidatingWebhookConfiguration` service references, check backing pod
+        health and OOM kills (`jsonPayload.reason="OOMKilling"`, `kubectl
+        describe pod`, and `kubectl logs <pod> --previous`), increase memory
+        limits on OOMKilled webhook controller pods (such as Gatekeeper or
+        Kubeflow `cache-server`), fix the backing deployment, or scope webhook
+        rules and `failurePolicy` so unavailable endpoints do not block
+        unrelated API operations.
     -   **Control-plane recommendations**: Strongly warn users against ignoring
         GKE control-plane recommendations about optimizing admission webhooks or
         CRDs with an invalid `caBundle` because unoptimized webhooks and invalid
