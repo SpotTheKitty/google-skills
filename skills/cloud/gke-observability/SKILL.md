@@ -9,7 +9,7 @@ description: >-
   monitoring permission errors. Don't use to configure local application logging
   frameworks or external APMs outside GKE.
 metadata:
-  version: "1.1.8"
+  version: "1.1.9"
   category: CloudObservabilityAndMonitoring
 ---
 
@@ -254,15 +254,47 @@ gcloud logging read \
   --quiet
 ```
 
--   **Hot-object write contention and `409 Conflict` storms**: When frequent
-    `409 Conflict` errors and high API server load suggest runaway controllers
-    are fighting over or excessively patching a single Kubernetes object, query
-    GKE Cloud Audit Logs (`cloudaudit.googleapis.com/activity`) grouped by
-    `protoPayload.resourceName` and `protoPayload.methodName` (`update` or
-    `patch`) to identify the specific object being hammered, and check
-    `protoPayload.authenticationInfo.principalEmail` or
-    `protoPayload.requestMetadata.callerSuppliedUserAgent` (or `kube-apiserver`
-    component logs) to identify the responsible controller.
+-   **Hot-object write contention, `409 Conflict` storms, and leader-election
+    `RenewDeadline` timeouts**: When frequent `409 Conflict` errors and high
+    `PATCH`/`PUT` latencies suggest runaway controllers are fighting over or
+    excessively patching a single Kubernetes object (such as a large
+    `ConfigMap`, `CustomResourceDefinition`, or `Lease`), query GKE Cloud Audit
+    Logs (`cloudaudit.googleapis.com/activity`) grouped by
+    `protoPayload.resourceName`, `protoPayload.methodName` (`update` or
+    `patch`), and `protoPayload.requestMetadata.callerSuppliedUserAgent` (or
+    `protoPayload.authenticationInfo.principalEmail`) and inspect
+    `kube-apiserver` `GuaranteedUpdate` trace logs to pinpoint the hot object
+    and responsible agent; mitigate by reducing the operator's checkpoint or
+    sync frequency (such as increasing `refreshInterval`) and lowering client
+    QPS. If third-party operators repeatedly lose Lease leadership with `context
+    deadline exceeded` after 5 seconds despite higher general client timeouts,
+    note that `client-go`'s `leaderelection` package sets the per-request HTTP
+    timeout on Lease `PUT` renewals to `RenewDeadline / 2` (so the default
+    `RenewDeadline: 10s` enforces `?timeout=5s`, visible on `requestURI` in
+    Cloud Audit Logs and `kube-apiserver` trace logs); increase the operator's
+    leader-election flags (such as `--leader-elect-lease-duration=60s` and
+    `--leader-elect-renew-deadline=40s`).
+-   **Excessive `pods/exec` saturating admission webhooks and Konnectivity**:
+    When `warden-validating.common-webhooks.networking.gke.io` admission
+    timeouts (`10s`) or `500 error dialing backend: dial timeout, backstop`
+    errors occur on `kubectl exec`, query Cloud Audit Logs for
+    `io.k8s.core.v1.pods.exec.get` (`connect`) request volume and correlate with
+    `apiserver_admission_webhook_admission_duration_seconds` for
+    `warden-validating` (high `pods/exec` volume evaluates against admission
+    webhooks and Konnectivity tunnels). Replace `kubectl exec`-based metrics
+    scraping and health checks with Kubelet `/metrics/cadvisor` or Cloud
+    Monitoring container metrics (`k8s_container`) and direct pod-to-pod
+    HTTP/gRPC endpoints.
+-   **Disabled Cloud KMS keys breaking control-plane encryption
+    (`kms-provider-0` / `failed to get dek primitive`)**: Inspect `gcloud
+    container clusters describe` (`databaseEncryption` configuration and error
+    status) and query Cloud Audit Logs for `cloudkms.googleapis.com`
+    (`DisableCryptoKeyVersion`, `DestroyCryptoKeyVersion`, or `PermissionDenied`
+    on `Encrypt`/`Decrypt`). Recover by re-enabling the disabled Cloud KMS
+    `CryptoKeyVersion`, ensuring the GKE service agent has the
+    `roles/cloudkms.cryptoKeyEncrypterDecrypter` IAM role, and following
+    https://docs.cloud.google.com/kubernetes-engine/docs/how-to/encrypting-secrets#reencrypt-secrets
+    to re-encrypt existing Secrets after key rotation or recovery.
 -   **End-to-end pod startup lifecycle timeline**: To determine whether a
     slow-starting pod was delayed during controller creation, scheduling,
     `kubelet` pickup, or container startup, reconstruct its timeline in Cloud
@@ -359,6 +391,22 @@ https://docs.cloud.google.com/kubernetes-engine/docs/how-to/view-logs#control_pl
         occupied by the request; weighting or summing `apf_iseats *
         apf_execution_time` by `user_agent` and `verb` reveals which clients
         consume the most API server concurrency capacity.
+    -   **Aggressive polling and APF saturation (`429` / `504` / `404`)**: When
+        workloads see `429 Too Many Requests` or `504 Gateway Timeout` (`context
+        canceled`), check APF metrics
+        (`apiserver_flowcontrol_priority_level_seat_utilization` and
+        `apiserver_flowcontrol_rejected_requests_total`) and
+        `apiserver_request_total` (by status code `404`/`504`/`429` and verb
+        `GET`/`LIST`), and enable control-plane logging (`API_SERVER` via
+        `--logging=SYSTEM,WORKLOAD,API_SERVER`) to pull detailed information on
+        `user_agent` (`userAgent`), target resources (`URI` / `requestURI`), and
+        source IPs (`src_ip` / `srcIP` / `sourceIPs`) from `kube-apiserver` logs
+        (or Cloud Audit Logs) to identify clients flooding the cluster with
+        unpaginated `LIST` calls, tight `404` `GET` polling loops, or
+        single-digit millisecond `?timeout=` requests; replace tight
+        `GET`/`LIST` polling loops with `SharedInformer` watches, add
+        exponential backoff on `404` responses, and increase overly short client
+        request timeouts.
 
 ## Alerting
 
